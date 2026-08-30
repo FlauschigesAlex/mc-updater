@@ -1,0 +1,206 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+      - create
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            binary: target/x86_64-pc-windows-msvc/release/mc-updater.exe
+            output: mc-updater-windows-x86_64.exe
+          - name: Linux x86_64
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            binary: target/x86_64-unknown-linux-gnu/release/mc-updater
+            output: mc-updater-linux-x86_64
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: target/x86_64-apple-darwin/release/mc-updater
+            output: mc-updater-macos-x86_64
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            binary: target/aarch64-apple-darwin/release/mc-updater
+            output: mc-updater-macos-aarch64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust target
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - name: Select stable Rust
+        run: rustup default stable
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'dist'
+          Copy-Item -LiteralPath '${{ matrix.binary }}' -Destination 'dist/${{ matrix.output }}'
+
+      - name: Upload binary
+        uses: actions/upload-artifact@v7
+        with:
+          path: dist/${{ matrix.output }}
+          archive: false
+          if-no-files-found: error
+
+  release:
+    name: Create release draft
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Download binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: mc-updater-*
+          path: dist
+          merge-multiple: true
+
+      - name: Read package version
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          version="$(cargo metadata --no-deps --format-version 1 | jq -er \
+            '.packages[] | select(.name == "mc-updater") | .version')"
+          tag="v${version}"
+
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          expected=(
+            mc-updater-windows-x86_64.exe
+            mc-updater-linux-x86_64
+            mc-updater-macos-x86_64
+            mc-updater-macos-aarch64
+          )
+
+          for asset in "${expected[@]}"; do
+            if [[ ! -f "dist/${asset}" ]]; then
+              echo "::error::Missing release asset: ${asset}"
+              exit 1
+            fi
+          done
+
+      - name: Generate release notes from commits
+        id: release-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          previous_tag="$(gh release list \
+            --exclude-drafts \
+            --limit 1 \
+            --order desc \
+            --json tagName \
+            --jq '.[0].tagName // ""')"
+
+          if [[ -n "$previous_tag" ]]; then
+            if ! git rev-parse --verify --quiet "refs/tags/${previous_tag}" >/dev/null; then
+              echo "::error::Tag for the latest published release was not fetched: ${previous_tag}"
+              exit 1
+            fi
+            commit_range="${previous_tag}..${GITHUB_SHA}"
+          else
+            commit_range="$GITHUB_SHA"
+          fi
+
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          included_commits=0
+          : > "$notes_file"
+
+          while IFS=$'\t' read -r subject author; do
+            if [[ "$author" == 'dependabot[bot]' ]]; then
+              continue
+            fi
+
+            printf -- '- %s (by %s)\n' "$subject" "$author" >> "$notes_file"
+            included_commits=$((included_commits + 1))
+          done < <(git log \
+            --no-merges \
+            --reverse \
+            --format='%s%x09%an' \
+            "$commit_range")
+
+          if [[ "$included_commits" -eq 0 ]]; then
+            echo '_No non-dependency changes._' > "$notes_file"
+          fi
+
+          echo "file=${notes_file}" >> "$GITHUB_OUTPUT"
+
+      - name: Replace existing release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${TAG}" 2>/dev/null)"; then
+            if [[ "$(jq -r '.draft' <<< "$release_json")" != 'true' ]]; then
+              echo "::error::Release ${TAG} is already published. Increase the version in Cargo.toml."
+              exit 1
+            fi
+
+            gh release delete "$TAG" --cleanup-tag --yes
+          elif gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "::error::Tag ${TAG} exists without a replaceable release draft. It will not be moved automatically."
+            exit 1
+          fi
+
+      - name: Create release draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          RELEASE_NOTES_FILE: ${{ steps.release-notes.outputs.file }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release create "$TAG" dist/* \
+            --draft \
+            --notes-file "$RELEASE_NOTES_FILE" \
+            --target "$GITHUB_SHA" \
+            --title "$TAG"
