@@ -13,6 +13,10 @@ mod config;
 
 #[tokio::main]
 async fn main() {
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    );
+        
     log::info!("Initializing server updater...");
     let path = Path::new("./config.json");
     let (config, _) = Config::load_or_create(&path).unwrap();
