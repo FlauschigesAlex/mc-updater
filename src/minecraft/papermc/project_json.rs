@@ -20,7 +20,6 @@ impl Versioning<SemanticVersion> for ProjectEntry {
     fn latest(&self) -> Option<&SemanticVersion> {
         return self.versions.latest()
     }
-
     fn oldest(&self) -> Option<&SemanticVersion> {
         return self.versions.oldest()
     }
