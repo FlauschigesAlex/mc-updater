@@ -11,7 +11,7 @@ use std::path::Path;
 pub struct Config {
     pub server_software: ServerSoftware,
     pub minecraft_version: String,
-    pub relative_path: Option<String>,
+    pub relative_path: Vec<String>,
 }
 
 impl Config {
@@ -19,7 +19,7 @@ impl Config {
         Self {
             server_software: ServerSoftware::default(),
             minecraft_version: "LATEST".to_string(),
-            relative_path: None,
+            relative_path: vec![],
         }
     }
 

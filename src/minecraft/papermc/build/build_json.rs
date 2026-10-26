@@ -42,6 +42,8 @@ pub struct FileDownload {
     pub size: u64,
     pub url: String,
     pub checksums: HashMap<String, String>,
+    #[serde(skip)]
+    pub(super) cached_download: Option<Vec<u8>>,
 }
 
 #[allow(async_fn_in_trait)]
